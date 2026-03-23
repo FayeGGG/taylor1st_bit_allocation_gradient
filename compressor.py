@@ -6,6 +6,7 @@ import numpy as np
 import time
 import copy
 import random
+import math
 from utils import LSTMModel, TransformerModel
 import torch.nn.functional as F
 from metrics import (
@@ -23,6 +24,7 @@ class GradientCompressor:
                  use_adaptive: bool = False,
                  adaptive_method: str = 'greedy',
                  device: torch.device = None,
+                 kimad_d_factor: int = 1000, # 添加 kimad+ 的 D 因子
                  allocation_metric: str = 'mse', 
                  total_epochs: int = 200
                  ):
@@ -32,6 +34,8 @@ class GradientCompressor:
         self.drop_ratio = drop_ratio
         self.use_adaptive = use_adaptive
         self.adaptive_method = adaptive_method
+
+        self.kimad_d_factor = kimad_d_factor
 
         self.alq_k = alq_k
 
@@ -612,7 +616,6 @@ class GradientCompressor:
         """设置 Fisher 信息矩阵（对角线）"""
         self.fisher_info = fisher_info
 
-    # ... (set_bit_allocation, get_layer_bits, compress, decompress, quantization methods unchanged) ...
 
     # === [新增] NewMetric 计算方法 ===
     def _calculate_new_metric(self, g_orig: torch.Tensor, g_quant: torch.Tensor, beta: float = 0.5) -> float:
@@ -789,12 +792,15 @@ class GradientCompressor:
             
             # 如果是第一步，没有 t-1，回退到普通的 taylor1 (使用 g_t)
             if grads_t_minus_1 is None or layer_name not in grads_t_minus_1:
-                # print("Warning: g_{t-1} missing (step 0?), fallback to g_t.")
-                return self._calculate_distortion(grad, bits, layer_name, data_batches, current_epoch, grads_t, grads_t_plus_1, None) # 递归调用 taylor1 逻辑需要把metric改一下，或者直接复制 taylor1 的代码
-                # 为了简单，直接复制 taylor1 的逻辑：
-                # g_t_curr = grads_t[layer_name]
-                # g_quant = self._direct_quantize(g_t_curr, bits)
-                # return calculate_adamw_taylor_1st_g_t_norm(g_t_curr, g_quant, self.optimizer, current_param, 1)
+                if grads_t is None: raise ValueError("`grads_t` is required.")
+                g_t = grads_t[layer_name]
+                g_quant = self._direct_quantize(g_t, bits)
+                if self.optimizer and current_param is not None:
+                    return calculate_adamw_taylor_1st_g_t_norm(
+                        g_t=g_t, g_t_quant=g_quant, optimizer=self.optimizer, param=current_param, num_params=1
+                    )
+                else:
+                    return abs(calculate_taylor_1st_error(g_t, g_quant - g_t, self.current_lr).item())
 
             g_t = grads_t[layer_name]        # 当前梯度
             g_prev = grads_t_minus_1[layer_name] # 历史梯度
@@ -820,8 +826,17 @@ class GradientCompressor:
         elif self.allocation_metric == 'taylor1_fully_historical':
             # 如果是第一步，没有 t-1，回退到普通的 taylor1 (使用 g_t)
             if grads_t_minus_1 is None or layer_name not in grads_t_minus_1:
-                return self._calculate_distortion(grad, bits, layer_name, data_batches, current_epoch, grads_t=grads_t, grads_t_plus_1=grads_t_plus_1) # 临时改 metric 调用有点麻烦，建议直接写 MSE 回退或者 taylor1 回退
-            
+                # [修复递归错误] 第一步没有历史，直接执行 taylor1 逻辑，不要递归调用
+                if grads_t is None: raise ValueError("`grads_t` is required.")
+                g_t = grads_t[layer_name]
+                g_quant = self._direct_quantize(g_t, bits)
+                if self.optimizer and current_param is not None:
+                    return calculate_adamw_taylor_1st_g_t_norm(
+                        g_t=g_t, g_t_quant=g_quant, optimizer=self.optimizer, param=current_param, num_params=1
+                    )
+                else:
+                    return abs(calculate_taylor_1st_error(g_t, g_quant - g_t, self.current_lr).item())
+                    
             # 完全使用历史梯度
             g_prev = grads_t_minus_1[layer_name]
             
@@ -916,6 +931,9 @@ class GradientCompressor:
         # 基于梯度独立计算最优分配
         if self.adaptive_method == 'lagrangian':
             bit_allocation = self.optimize_bit_allocation_lagrangian(original_grads, data_batches_for_rd, current_epoch, current_iter, grads_t, grads_t_plus_1, grads_t_minus_1)
+        elif self.adaptive_method == 'kimad_dp':
+            # Kimad+ 使用L2误差，不需要数据batch
+            bit_allocation = self.optimize_bit_allocation_kimad_dp(original_grads, current_epoch, current_iter)
         else:
             # bit_allocation = self.optimize_bit_allocation_greedy(original_grads, current_epoch, current_iter)
             bit_allocation = self.optimize_bit_allocation_greedy(original_grads, data_batches_for_rd, current_epoch, current_iter, grads_t, grads_t_plus_1, grads_t_minus_1)
@@ -947,22 +965,7 @@ class GradientCompressor:
         for name, grad in original_grads.items():
             min_bits = min(self.bit_options)
 
-            # mse
-            # compressed = self._direct_quantize(grad, min_bits)
-            # error = torch.norm(grad - compressed) ** 2
-            # num_params = grad.numel()
-            # average_error = error.item() / num_params
-            # layer_errors[name] = average_error
-
-            # 使用loss difference而不是MSE
-            # total_distortion = self._get_avg_loss_difference(
-            #     original_grad_subset={name: grad}, # 只传当前层的梯度
-            #     bits=min_bits, 
-            #     layer_name=name, 
-            #     data_batches=data_batches_for_rd # 使用传入的多个batch
-            # )
-
-             # === 使用新的统一接口计算总失真 ===
+            # === 使用统一接口计算总失真 ===
             total_distortion = self._calculate_distortion(
                     grad, min_bits, name, data_batches_for_rd, current_epoch,
                     grads_t, grads_t_plus_1, grads_t_minus_1 # << 传递额外参数
@@ -1009,22 +1012,8 @@ class GradientCompressor:
                 remaining_budget -= bits_needed
 
                 # print(f"[Greedy] Iter {iteration}: Upgraded {name} from {current_bits} to {next_bits} bits (error={current_error:.8f})")
-                
-                # 更新该层的误差
-                # mse
-                # compressed = self._direct_quantize(original_grads[name], next_bits)
-                # error = torch.norm(original_grads[name] - compressed) ** 2
-                # layer_errors[name] = error.item() / params
-                
-                # 更新该层的误差 - 修改：使用loss difference
-                # avg_loss_diff = self._get_avg_loss_difference(
-                #     original_grad_subset={name: original_grads[name]},
-                #     bits=next_bits,
-                #     layer_name=name,
-                #     data_batches=data_batches_for_rd
-                # )
 
-                # === [修改] 更新该层的误差，使用统一接口 ===
+                # === 更新该层的误差，使用统一接口 ===
                 total_distortion = self._calculate_distortion(
                     original_grads[name], next_bits, name, data_batches_for_rd, current_epoch,
                     grads_t, grads_t_plus_1, grads_t_minus_1 # << 传递额外参数
@@ -1049,6 +1038,169 @@ class GradientCompressor:
         
         self._current_bit_allocation = current_allocation
         return current_allocation
+  
+    def optimize_bit_allocation_kimad_dp(self, original_grads: Dict[str, torch.Tensor],
+                                         current_epoch: int = None, 
+                                         current_iter: int = None) -> Dict[str, int]:
+        """
+        [DEFINITIVE FIX] 使用标准的二维动态规划和正确的回溯逻辑，
+        忠实复现 Kimad+ 的分组背包问题解法。
+        """
+        print("\n=== [DEFINITIVE FIX] Kimad+ Style Bit Allocation with 2D-DP ===")
+        start_time = time.time()
+        
+        # 1. 初始化
+        # 过滤掉不需要梯度的参数（虽然理论上都有，但为了健壮性）
+        layer_names = [name for name, grad in original_grads.items() if grad.numel() > 0]
+        num_layers = len(layer_names)
+        
+        valid_grads = {name: original_grads[name] for name in layer_names}
+        total_params = sum(grad.numel() for grad in valid_grads.values())
+        bit_budget_real = total_params * self._target_bits
+
+        # 预算离散化：Kimad 论文通常设置 d_factor=1000 左右，将背包容量离散化
+        # 防止 bit_step 为 0
+        bit_step = max(1, int(total_params / getattr(self, 'kimad_d_factor', 1000)))
+        discrete_budget = int(bit_budget_real / bit_step)
+        
+        print(f"Target Bit Budget: {int(bit_budget_real):,}. DP Discrete Budget={discrete_budget} (step={bit_step})")
+
+        # 2. 预计算成本和误差
+        print("Step 1: Pre-computing costs and errors...")
+        # costs[i][j]: 第 i 层的第 j 个比特选项的离散成本 (向上取整以保守估计)
+        costs = [[math.ceil((bits * valid_grads[name].numel()) / bit_step) 
+                  for bits in self.bit_options] 
+                 for name in layer_names]
+        
+        # errors[i][j]: 第 i 层的第 j 个比特选项的 L2 误差平方
+        errors = np.zeros((num_layers, len(self.bit_options)))
+        with torch.no_grad():
+            for i, name in enumerate(layer_names):
+                grad = valid_grads[name]
+                for j, bits in enumerate(self.bit_options):
+                    # 注意：这里必须用 L2 误差平方 (Sum of Squared Errors)
+                    quant_grad = self._direct_quantize(grad, bits)
+                    # Kimad 使用的是 ||g - Q(g)||^2
+                    errors[i, j] = torch.sum((grad - quant_grad) ** 2).item()
+
+        # 3. 动态规划求解 (分组背包问题)
+        print("Step 2: Solving with Group Knapsack DP...")
+        
+        # dp[i][b] = 考虑前 i 组（层），恰好/累计使用预算 b 的最小误差
+        dp = np.full((num_layers + 1, discrete_budget + 1), np.inf)
+        
+        # backtrack[i][b] = 记录第 i 组在预算 b 时选择了哪个比特选项索引
+        backtrack = np.zeros((num_layers + 1, discrete_budget + 1), dtype=np.int8)
+        
+        # === [CRITICAL FIX] 初始化 ===
+        # 只有 "0层、0预算" 是合法初始状态。
+        # 0层消耗非0预算是不可能的，所以保持 inf。
+        dp[0, 0] = 0
+
+        for i in range(1, num_layers + 1): # i 表示第 i 层 (1-based in DP table)
+            layer_idx = i - 1
+            # 优化：不需要遍历所有预算，只遍历可能达到的范围
+            # 但为了代码简单清晰，遍历全量预算通常也可以（numpy很快）
+            for j, bits in enumerate(self.bit_options):
+                cost = costs[layer_idx][j]
+                error = errors[layer_idx][j]
+                
+                # 状态转移：dp[i, b] = min(dp[i-1, b-cost] + error)
+                # 使用 numpy 切片加速：同时更新所有可能的 b
+                # valid_indices 是那些上一层状态不为 inf 的索引
+                
+                # Python 循环写法 (易于理解):
+                # for b in range(cost, discrete_budget + 1):
+                #     if dp[i-1, b - cost] != np.inf:
+                #         new_err = dp[i-1, b - cost] + error
+                #         if new_err < dp[i, b]:
+                #             dp[i, b] = new_err
+                #             backtrack[i, b] = j
+                
+                # Numpy 向量化写法 (加速):
+                # 找到上一层所有的有效状态
+                prev_layer_costs = dp[i-1, :]
+                valid_mask = prev_layer_costs != np.inf
+                
+                # 计算当前状态的位置：上一层的位置 + cost
+                # 我们只需要考虑那些 (prev_idx + cost) <= discrete_budget 的情况
+                # 这是一个稍微复杂的向量化，为了保证正确性，这里建议用半向量化或上面的循环
+                # 为了稳健性，这里保留上面的显式循环逻辑的优化版：
+                
+                lower_bound = cost
+                # 只有当 b >= cost 且 dp[i-1, b-cost] 有值时才更新
+                # 我们可以遍历 budget b
+                for b in range(lower_bound, discrete_budget + 1):
+                    prev_val = dp[i-1, b - cost]
+                    if prev_val != np.inf:
+                         new_val = prev_val + error
+                         if new_val < dp[i, b]:
+                             dp[i, b] = new_val
+                             backtrack[i, b] = j
+
+        # 4. 回溯找到最优解
+        print("Step 3: Backtracking to find the optimal allocation...")
+        
+        # 在最后一行 (考虑了所有层) 找到最小误差
+        # 注意：我们必须检查是否真的找到了解 (即 min value 不是 inf)
+        min_error = np.min(dp[num_layers])
+        
+        if min_error == np.inf:
+            print("[WARNING] DP failed to find a feasible solution within budget!")
+            # 降级策略：全部分配最小比特
+            return {name: min(self.bit_options) for name in original_grads}
+
+        # 找到最小误差对应的预算索引
+        # np.argmin 会返回第一个出现的最小值索引。
+        # 在误差相同的情况下，我们倾向于使用较小的预算吗？是的。
+        # 如果误差随着预算增加而单调递减，最小值通常出现在预算较大处。
+        final_best_budget = np.argmin(dp[num_layers])
+        
+        final_allocation = {}
+        current_budget = int(final_best_budget)
+
+        for i in range(num_layers, 0, -1):
+            layer_idx = i - 1
+            layer_name = layer_names[layer_idx]
+            
+            # 获取选择
+            bit_option_idx = backtrack[i, current_budget]
+            final_allocation[layer_name] = self.bit_options[bit_option_idx]
+            
+            # 更新剩余预算
+            cost = costs[layer_idx][bit_option_idx]
+            current_budget -= cost
+            
+            # 安全检查：预算不应小于0 (如果逻辑正确，不会发生)
+            if current_budget < 0:
+                print(f"[ERROR] Backtracking logic error at layer {layer_name}")
+                current_budget = 0
+
+        # 补充遗漏的层（如果有）
+        min_bits = min(self.bit_options)
+        for name in original_grads:
+            if name not in final_allocation:
+                final_allocation[name] = min_bits
+
+        # 5. 结果展示与验证
+        allocation_time = time.time() - start_time
+        self.bit_allocation_times.append(allocation_time)
+        self.total_bit_allocation_time += allocation_time
+
+        final_used_bits = sum(final_allocation.get(name, 0) * original_grads[name].numel() for name in original_grads)
+        
+        print(f"DP search completed in {allocation_time:.3f}s.")
+        print(f"Final minimum error (L2 sum): {min_error:.4f}")
+        print(f"Total Bits Used: {int(final_used_bits):,} / {int(bit_budget_real):,} ({final_used_bits / bit_budget_real * 100:.2f}%)")
+
+        # 允许微小的误差 (由于 ceil 离散化)
+        if final_used_bits > bit_budget_real:
+             print(f"[WARNING] Allocation slightly exceeds budget due to discretization: {final_used_bits} > {bit_budget_real}")
+
+        self._current_bit_allocation = final_allocation
+        self.log_bit_allocation(final_allocation, original_grads)
+        
+        return final_allocation
 
 
     def _compute_loss_difference_for_single_batch(self, original_grad_subset: Dict[str, torch.Tensor], bits: int, layer_name: str, 
@@ -1130,7 +1282,7 @@ class GradientCompressor:
         data_batches: List[Tuple[torch.Tensor, torch.Tensor]]
     ) -> float:
         """
-        [新函数] 计算在多个数据batch上的平均loss difference。
+        计算在多个数据batch上的平均loss difference。
         """
         if not data_batches:
             print("Warning: No data batches provided for loss difference calculation.")
@@ -1148,30 +1300,122 @@ class GradientCompressor:
         
         return total_loss_diff / len(data_batches)
 
-    def enforce_monotonicity(self, rd_points: List[Dict]) -> List[Dict]:
-        # 1. 按rate排序
-        rd_points.sort(key=lambda p: p['rate'])
+    # def enforce_monotonicity(self, rd_points: List[Dict]) -> List[Dict]:
+    #     # 1. 按rate排序
+    #     rd_points.sort(key=lambda p: p['rate'])
         
+    #     monotonic_points = []
+    #     if not rd_points:
+    #         return []
+            
+    #     # 2. 总是接受第一个点（最低比特）
+    #     monotonic_points.append(rd_points[0])
+        
+    #     # 3. 遍历剩余的点
+    #     for i in range(1, len(rd_points)):
+    #         current_point = rd_points[i]
+    #         last_monotonic_point = monotonic_points[-1]
+            
+    #         # 只有在失真更低时才接受
+    #         if current_point['dist'] < last_monotonic_point['dist']:
+    #             # 确保rate也增加了，避免重复rate
+    #             if current_point['rate'] > last_monotonic_point['rate']:
+    #                 monotonic_points.append(current_point)
+        
+    #     return monotonic_points
+
+    def enforce_monotonicity(self, rd_points: List[Dict]) -> List[Dict]:
+        rd_points.sort(key=lambda p: p['rate'])
         monotonic_points = []
         if not rd_points:
             return []
             
-        # 2. 总是接受第一个点（最低比特）
         monotonic_points.append(rd_points[0])
         
-        # 3. 遍历剩余的点
         for i in range(1, len(rd_points)):
             current_point = rd_points[i]
             last_monotonic_point = monotonic_points[-1]
             
-            # 只有在失真更低时才接受
-            if current_point['dist'] < last_monotonic_point['dist']:
-                # 还有一个检查：确保rate也增加了，避免重复rate
+            # 宽松的单调性检查：允许相等，或者非常微小的增加（噪声）
+            # 对于 NLP，loss_diff 可能会有波动，我们希望保留高比特选项以便 Greedy 填充
+            if current_point['dist'] <= last_monotonic_point['dist'] * 1.0001: # 允许万分之一的误差
                 if current_point['rate'] > last_monotonic_point['rate']:
                     monotonic_points.append(current_point)
+            else:
+                # 只有当失真显著增加时才跳过，这在 MSE 下不可能，但在 Loss Diff 下可能
+                pass 
         
         return monotonic_points
 
+    def _greedy_fill_budget(self, current_allocation, rd_data, param_counts, bit_budget):
+        """
+        [Final Fix] 迭代式强制填充。
+        不依赖 rd_data 的完整性，只要 budget 允许且未达最大比特，就强制升级。
+        优先升级大层（Embedding），确保利用率接近 100%。
+        """
+        layer_names = list(current_allocation.keys())
+        max_bits = max(self.bit_options)
+        
+        # 迭代循环，直到无法再塞入任何层
+        while True:
+            current_used_bits = sum(current_allocation[n] * param_counts[n] for n in layer_names)
+            remaining_budget = bit_budget - current_used_bits
+            
+            best_candidate = None
+            best_score = -1.0
+            
+            # 寻找当前最佳的“一步”升级
+            for name in layer_names:
+                current_bit = current_allocation[name]
+                
+                # 1. 检查是否已达上限
+                if current_bit >= max_bits:
+                    continue
+                
+                # 2. 找到下一档比特
+                # self.bit_options 是排好序的，例如 [2, 4, 8] 或 [1, 2, ..., 8]
+                # 我们找到比 current_bit 大的最小那个
+                next_bit = next((b for b in self.bit_options if b > current_bit), None)
+                if next_bit is None: continue
+                
+                # 3. 检查预算是否足够
+                cost = (next_bit - current_bit) * param_counts[name]
+                if cost > remaining_budget:
+                    continue
+                
+                # 4. 计算收益 (Score)
+                # 优先使用真实 R-D 数据，如果缺失，使用启发式估计
+                gain = 0.0
+                points = rd_data.get(name, [])
+                
+                curr_point = next((p for p in points if p['bits'] == current_bit), None)
+                next_point = next((p for p in points if p['bits'] == next_bit), None)
+                
+                if curr_point and next_point:
+                    # 真实数据的总失真减少量
+                    gain = (curr_point['dist'] - next_point['dist']) * param_counts[name]
+                else:
+                    # [关键修复] 数据缺失时的启发式估计
+                    # 假设每增加 1 bit，MSE 减半 (或者失真减小一部分)
+                    # 我们给大参数层一个巨大的基础权重，确保它被选中
+                    # Base score = 参数量 * 常数。这样大层永远优先。
+                    gain = param_counts[name] * 1e-6 # 只要是正数，大层就会因为 param_counts 巨大而胜出
+                
+                # 评分标准：Total Gain (倾向于大层)
+                if gain > best_score:
+                    best_score = gain
+                    best_candidate = (name, next_bit, cost)
+            
+            # 如果找不到任何可升级的层（预算耗尽或全满），退出循环
+            if best_candidate is None:
+                break
+                
+            # 执行升级
+            name, next_bit, cost = best_candidate
+            current_allocation[name] = next_bit
+            # print(f"  [Greedy Fill] Upgrading {name}: {current_allocation[name]} -> {next_bit} (Cost: {cost:,.0f})")
+            
+        return current_allocation
 
     def optimize_bit_allocation_lagrangian(self, original_grads: Dict[str, torch.Tensor],
                                            data_batches_for_rd: List[Tuple[torch.Tensor, torch.Tensor]], # << 新增参数
@@ -1180,12 +1424,12 @@ class GradientCompressor:
                                            grads_t_plus_1: Dict[str, torch.Tensor] = None,
                                            grads_t_minus_1: Dict[str, torch.Tensor] = None) -> Dict[str, int]:
         """
-        使用二分搜索和更精确的λ范围估算的拉格朗日乘数法。
+        使用二分搜索和更精确的λ范围估算的拉格朗日乘数法，包含 Greedy Filling。
         """
         if not self.use_adaptive:
             return {name: self._target_bits for name in original_grads.keys()}
 
-        print("\n=== Lagrangian Bit Allocation with Bisection Search (using Loss Difference) ===")
+        print("\n=== Lagrangian Bit Allocation with Bisection Search (Fix: with Greedy Fill) ===")
         start_time = time.time()
         
         layer_names = list(original_grads.keys())
@@ -1200,56 +1444,27 @@ class GradientCompressor:
         # R: 比特数 (per parameter)
         rd_data = {}
         min_lambdas, max_lambdas = [], []
-        all_dist_values = [] 
 
         print("Step 1: Calculating Rate-Distortion points for each layer...")
         for idx, (name, grad) in enumerate(original_grads.items()):
             if grad.numel() == 0:
                 continue
-            
             # 打印进度，因为这一步会很慢
             # print(f"  Processing layer {idx+1}/{len(layer_names)}: {name} ...", end='', flush=True)
             # layer_start_time = time.time()
-            
             rd_points = []
             for bits in self.bit_options:
-
-                # === 使用新的统一接口计算总失真 ===
+                # === 使用统一接口计算总失真 ===
                 total_distortion = self._calculate_distortion(
                     grad, bits, name, data_batches_for_rd, current_epoch,
-                    grads_t, grads_t_plus_1, grads_t_minus_1
+                    grads_t, grads_t_plus_1, grads_t_minus_1 # << 传递额外参数
                 )
-
-                # # === 多次采样取平均以消除随机噪声 ===
-                # num_trials = 5  # 采样次数，建议 5-10 次
-                # avg_distortion = 0.0
-                
-                # for _ in range(num_trials):
-                #     # 每次调用 _calculate_distortion 内部都会重新进行一次随机量化
-                #     dist = self._calculate_distortion(
-                #         grad, bits, name, data_batches_for_rd, current_epoch,
-                #         grads_t, grads_t_plus_1, grads_t_minus_1
-                #     )
-                #     avg_distortion += dist
-                
-                # total_distortion = avg_distortion / num_trials
                 
                 # 归一化失真和比特率
-                # distortion_per_param = total_distortion / grad.numel() if grad.numel() > 0 else 0
-                # rate_per_param = bits
-                # rd_points.append({'rate': rate_per_param, 'dist': distortion_per_param, 'bits': bits})
-
+                distortion_per_param = total_distortion / grad.numel() if grad.numel() > 0 else 0
+                rate_per_param = bits
                 
-                # 不归一化：计算总代价 (必须乘以 numel)
-                total_bits_cost = grad.numel() * bits 
-                
-                rd_points.append({
-                    'rate': total_bits_cost, # 横轴：真实的总比特消耗
-                    'bits_per_param': bits,  # 记录一下仅仅为了后续方便取用
-                    'dist': total_distortion # 纵轴：真实的总失真
-                })
-
-                all_dist_values.append(total_distortion)
+                rd_points.append({'rate': rate_per_param, 'dist': distortion_per_param, 'bits': bits})
             
             # 按比特率排序，确保单调性
             rd_points.sort(key=lambda p: p['rate'])
@@ -1261,26 +1476,6 @@ class GradientCompressor:
             
             # layer_duration = time.time() - layer_start_time
             # print(f" done in {layer_duration:.2f}s.")
-        
-        # === Step 2: 全局缩放 (Global Scaling) ===
-        # 解决 AdamW 下 Total Distortion 可能只有 1e-25 的问题
-        if not all_dist_values:
-             return {name: self._target_bits for name in original_grads.keys()}
-             
-        global_max_dist = max(all_dist_values)
-        print('global_max_dist:',global_max_dist)
-        if global_max_dist <= 1e-50: global_max_dist = 1e-50
-        
-        # 将最大失真拉到 100.0 的量级，让 float64 计算斜率更舒服
-        scale_factor = 1e10 / global_max_dist 
-
-        min_lambdas, max_lambdas = [], []
-        EPSILON = 1e-9 
-
-        for name in rd_data:
-            points = rd_data[name]
-            for p in points:
-                p['scaled_dist'] = p['dist'] * scale_factor
 
             # 2. 估算λ的搜索范围
             # λ ≈ |-ΔD/ΔR|。我们计算相邻点之间的斜率来确定范围。
@@ -1292,7 +1487,7 @@ class GradientCompressor:
                 if r2 > r1 and d1 > d2:
                     # 斜率的绝对值
                     slope = abs((d2 - d1) / (r2 - r1))
-                    if slope > 0:  # 避免无效或极小的斜率
+                    if slope > 1e-25:  # 避免无效或极小的斜率
                         min_lambdas.append(slope)
                         max_lambdas.append(slope)
         # 仅在缓存为空（即第一次调用此方法）时，填充 R-D 数据缓存。
@@ -1309,8 +1504,8 @@ class GradientCompressor:
             return {name: self._target_bits for name in original_grads.keys()}
 
         # 确定一个健壮的搜索范围
-        lambda_low = min(min_lambdas) * 1e-20
-        lambda_high = max(max_lambdas) * 1e50
+        lambda_low = min(min_lambdas) * 1e-10
+        lambda_high = max(max_lambdas) * 1000.0
         
         print("\nStep 2: Performing Bisection Search for optimal Lambda.")
         print(f"Estimated Lambda Search Range: [{lambda_low:.2e}, {lambda_high:.2e}]")
@@ -1320,9 +1515,9 @@ class GradientCompressor:
         best_total_bits = 0
         
         # 迭代次数可以根据需要的精度调整，30-50次通常足够
-        for i in range(100):
+        for i in range(50):
             lambda_mid = (lambda_low + lambda_high) / 2
-            if lambda_mid < 1e-50: break # 防止lambda过小
+            if lambda_mid < 1e-25: break # 防止lambda过小
 
             current_allocation = {}
             current_total_bits = 0
@@ -1361,6 +1556,12 @@ class GradientCompressor:
             best_allocation = {name: min(self.bit_options) for name in layer_names}
             best_total_bits = sum(min(self.bit_options) * p for p in param_counts.values())
 
+        # 3. [CRITICAL FIX] Greedy Residual Filling
+        # 在 Embedding 导致大块闲置预算时，将闲置预算分配给其他层
+        print(f"Lagrangian result usage: {best_total_bits/bit_budget*100:.2f}%")
+        
+        final_allocation = self._greedy_fill_budget(best_allocation, rd_data, param_counts, bit_budget)
+
         # 4. 结果展示
         allocation_time = time.time() - start_time
         self.bit_allocation_times.append(allocation_time)
@@ -1376,7 +1577,6 @@ class GradientCompressor:
         self.log_bit_allocation(best_allocation, original_grads) # 使用你已有的日志函数
 
         return best_allocation
-
 
     def get_bit_allocation_stats(self) -> Dict:
         """获取比特分配时间统计信息"""

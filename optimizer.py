@@ -594,12 +594,20 @@ class CompressedOptimizer:
 
                 is_sensitive = False
                 ln = layer_name.lower()
-                if 'embedding' in ln or 'token_emb' in ln or 'pos_encoder' in ln:
+                # === 修改开始 ===
+                # 1. Embedding 层：通常必须压缩，否则压缩率上不去。
+                # 除非你发现 Embedding 压缩导致严重不收敛，否则不要跳过它。
+                # if 'embedding' in ln or 'token_emb' in ln or 'pos_encoder' in ln:
+                #     is_sensitive = True  <-- 注释掉这一行，让 Embedding 参与压缩
+                
+                # 2. 偏置项 (Bias)：参数很少，为了稳定通常不压缩
+                if 'bias' in ln:
                     is_sensitive = True
-                elif 'bias' in ln:
+                
+                # 3. 归一化层 (Norm)：参数很少，为了稳定通常不压缩
+                elif 'norm' in ln or 'bn' in ln: # layer_norm, batch_norm
                     is_sensitive = True
-                elif 'norm' in ln or 'bn' in ln: 
-                    is_sensitive = True
+                # === 修改结束 ===
                 
                 if is_sensitive:
                     decompressed_grad = gradient

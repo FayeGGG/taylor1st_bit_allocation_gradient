@@ -45,7 +45,7 @@ def calculate_taylor_1st_g_t_norm(g_layer: torch.Tensor, delta_g_layer: torch.Te
     Calculates the normalized first-order Taylor approximation of the loss change.
     Approximation: L_diff ≈ η * g_t^T ⋅ Δg_t
     """
-    return -learning_rate * torch.sum(g_layer * delta_g_layer) / num_params
+    return abs(-learning_rate * torch.sum(g_layer * delta_g_layer) / num_params)
 
 def calculate_taylor_1st_g_t_plus_1_norm(g_t_plus_1_layer: torch.Tensor, delta_g_layer: torch.Tensor,
                                         learning_rate: float, num_params: int):
@@ -54,7 +54,7 @@ def calculate_taylor_1st_g_t_plus_1_norm(g_t_plus_1_layer: torch.Tensor, delta_g
     Approximation: L_diff ≈ η * g_{t+1}^T ⋅ Δg_t
     This is a "lookahead" metric used to validate the g_t approximation.
     """
-    return -learning_rate * torch.sum(g_t_plus_1_layer * delta_g_layer) / num_params
+    return abs(-learning_rate * torch.sum(g_t_plus_1_layer * delta_g_layer) / num_params)
 
 # --- Second-Order Proxy Metric (HVP) ---
 
@@ -274,7 +274,7 @@ def calculate_adamw_taylor_1st_g_t_norm(g_t: torch.Tensor,
     # 2. 投影到 g_t 上
     taylor_val = torch.sum(g_t * diff_w).item()
     
-    return taylor_val / num_params
+    return abs(taylor_val / num_params)
 
 
 def calculate_adamw_taylor_1st_g_t_plus_1_norm(g_t: torch.Tensor,
@@ -304,4 +304,4 @@ def calculate_adamw_taylor_1st_g_t_plus_1_norm(g_t: torch.Tensor,
     # 2. 投影到 g_{t+1} 上
     taylor_val = torch.sum(g_t_plus_1 * diff_w).item()
     
-    return taylor_val / num_params
+    return abs(taylor_val / num_params)
