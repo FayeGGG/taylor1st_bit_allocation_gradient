@@ -26,9 +26,11 @@ def main():
                        help='Method to use. Use "full" for full-precision training')
     parser.add_argument('--run-adaptive', action='store_true',
                        help='Whether to run adaptive version')
-    parser.add_argument('--adaptive-method', type=str, choices=['greedy', 'lagrangian'], 
+    parser.add_argument('--adaptive-method', type=str, choices=['greedy', 'lagrangian', 'kimad_dp'], 
                         default='lagrangian',
                         help='Method for adaptive bit allocation (greedy or lagrangian)')
+    parser.add_argument('--kimad-d-factor', type=int, default=1000,
+                        help='Error discretization factor D for the Kimad+ DP solver.')
     
     # 压缩设置
     parser.add_argument('--alq-k', type=float, default=3.0,
@@ -217,7 +219,8 @@ def main():
         'device': device,
         'alq_k': args.alq_k,
         'allocation_metric': args.allocation_metric,
-        'total_epochs': args.epochs, 
+        'total_epochs': args.epochs,
+        'kimad_d_factor': args.kimad_d_factor
     }
 
     experiment_name = f"{args.model}_{args.dataset}_{args.method}_{args.bits}"
